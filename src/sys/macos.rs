@@ -3,7 +3,10 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, ReadBuf};
 
 pub(crate) struct Port {
     fd: AsyncFd<OwnedFd>,
@@ -24,6 +27,50 @@ impl Port {
         };
         let async_fd = AsyncFd::new(fd)?;
         Ok(Self { fd: async_fd })
+    }
+}
+
+impl AsyncRead for Port {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = self.get_mut();
+        loop {
+            let mut guard = ready!(this.fd.poll_read_ready(cx))?;
+            let destination = buf.initialize_unfilled();
+            match guard.try_io(|async_fd| read_fd(async_fd.as_fd(), destination)) {
+                Ok(Ok(count)) => {
+                    buf.advance(count);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(error)) => return Poll::Ready(Err(error)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+/// Helper to read from a `BorrowedFd` and retry syscall if interrupted
+fn read_fd(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> std::io::Result<usize> {
+    // TODO: Consider cleaning this up with rustix
+    loop {
+        let result =
+            unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            // Retry interrupted syscall immediately
+            continue;
+        }
+        return Err(error);
     }
 }
 

@@ -238,3 +238,192 @@ fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, OsStr};
+    use std::future::Future;
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use std::task::Waker;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    // `ttyname_r` is unusually flakey on macOS in my testing. Apple recommends usings `ptsname_r`
+    // anyway instead of `openpty`'s approach of returning the name into an unchecked buffer.
+    // However, `ptsname_r` is not exposed in `libc` so I had to put the `extern` here. This is
+    // currently only used in tests so it's fine in my opinion.
+    unsafe extern "C" {
+        fn ptsname_r(
+            file_descriptor: libc::c_int,
+            buffer: *mut libc::c_char,
+            buffer_length: libc::size_t,
+        ) -> libc::c_int;
+    }
+
+    // TODO: Investigate rustix-openpty. Might be an option for cleaning up tests.
+    struct Pty {
+        master: std::fs::File,
+        slave_path: PathBuf,
+    }
+
+    fn settings() -> Settings {
+        Settings {
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+        }
+    }
+
+    fn open_pty() -> std::io::Result<Pty> {
+        let mut master = -1;
+        let mut slave = -1;
+
+        syscall_result(unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        })?;
+
+        // SAFETY: `openpty` succeeded and transferred ownership of `master`.
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        // SAFETY: `openpty` succeeded and transferred ownership of `slave`.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+        let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: `master` is the primary PTY descriptor and `path` is a valid writable buffer
+        // whose exact length is supplied.
+        syscall_result(unsafe { ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) })?;
+
+        // SAFETY: `ptsname_r` succeeded and wrote a null-terminated path within `path`.
+        let path = unsafe { CStr::from_ptr(path.as_ptr()) };
+        let slave_path = PathBuf::from(OsStr::from_bytes(path.to_bytes()));
+        drop(slave);
+
+        Ok(Pty { master, slave_path })
+    }
+
+    async fn open_test_port() -> std::io::Result<(std::fs::File, Port)> {
+        let Pty { master, slave_path } = open_pty()?;
+        let port = Port::open(slave_path, settings()).await?;
+        Ok((master, port))
+    }
+
+    async fn timeout_io<T>(future: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+        tokio::time::timeout(TEST_TIMEOUT, future)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "PTY operation timed out")
+            })?
+    }
+
+    async fn complete_after_pending<T>(
+        future: impl Future<Output = std::io::Result<T>>,
+        on_pending: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<T> {
+        let mut future = std::pin::pin!(future);
+        let mut on_pending = Some(on_pending);
+        let result = timeout_io(std::future::poll_fn(|cx| {
+            let result = future.as_mut().poll(cx);
+            if result.is_pending()
+                && let Some(on_pending) = on_pending.take()
+                && let Err(error) = on_pending()
+            {
+                return Poll::Ready(Err(error));
+            }
+            result
+        }))
+        .await;
+
+        assert!(
+            on_pending.is_none(),
+            "operation completed without first returning Pending"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_read_completes_immediately() -> std::io::Result<()> {
+        let (_master, mut port) = open_test_port().await?;
+
+        let mut bytes = [];
+        let mut read_buf = ReadBuf::new(&mut bytes);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        let result = Pin::new(&mut port).poll_read(&mut context, &mut read_buf);
+
+        assert!(matches!(result, Poll::Ready(Ok(()))));
+        assert!(read_buf.filled().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_multiple_arrivals() -> std::io::Result<()> {
+        let (mut master, mut port) = open_test_port().await?;
+
+        master.write_all(b"hello")?;
+        let mut first = [0; 5];
+        timeout_io(port.read_exact(&mut first)).await?;
+        assert_eq!(&first, b"hello");
+
+        let mut second = [0; 5];
+        complete_after_pending(port.read_exact(&mut second), || master.write_all(b"world")).await?;
+        assert_eq!(&second, b"world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_read_completes_when_master_closes() -> std::io::Result<()> {
+        let (master, mut port) = open_test_port().await?;
+        let mut master = Some(master);
+        let mut received = [0; 1];
+
+        let result = complete_after_pending(port.read(&mut received), || {
+            drop(master.take());
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(0) => {}
+            Ok(count) => panic!("read returned {count} bytes after PTY hangup"),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => return Err(error),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_non_tty_path() {
+        const NON_TTY_PATH: &str = "/dev/null";
+        let error = match Port::open(NON_TTY_PATH, settings()).await {
+            Ok(_) => panic!(
+                "incorrectly able to open non-tty path {} as a serial port",
+                NON_TTY_PATH
+            ),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENODEV) | Some(libc::ENOTTY)
+            ),
+            "unexpected error while opening non-tty path: {error}"
+        );
+    }
+}

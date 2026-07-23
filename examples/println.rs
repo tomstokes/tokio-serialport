@@ -9,6 +9,6 @@ async fn main() -> std::io::Result<()> {
     let mut port = SerialPort::open(path, 115200).await?;
     let mut bytes = [0; 1024];
     let result = port.read(&mut bytes).await;
-    dbg!(result);
+    let _ = dbg!(result);
     Ok(())
 }

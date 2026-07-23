@@ -246,8 +246,50 @@ fn configure_port(fd: BorrowedFd, settings: &Settings) -> std::io::Result<()> {
     }
 
     // Configure baud rate
-    // TODO: Handle non-standard baud rates
-    let baud_rate = match settings.baud_rate {
+    let baud_rate = settings.baud_rate;
+    let custom_baud_rate: Option<libc::speed_t> = if baud_rate == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "baud rate cannot be zero",
+        ));
+    } else if let Some(standard_speed) = standard_baud_rate(settings.baud_rate) {
+        syscall_result(unsafe { libc::cfsetspeed(&mut termios, standard_speed) })?;
+        None
+    } else {
+        syscall_result(unsafe { libc::cfsetspeed(&mut termios, libc::B9600) })?;
+        Some(baud_rate.into())
+    };
+
+    // Set the termios parameters on the fd
+    syscall_result(unsafe { libc::tcsetattr(raw_fd, libc::TCSANOW, &termios) })?;
+
+    // `IOSSIOSPEED` comes from Apple's <IOKit/serial/ioss.h>
+    // It is derived at compile time and depends on `sizeof(speed_t)`, resulting in different values
+    // on 32-bit or 64-bit systems. We could use a #[cfg] statement to special case, but calculating
+    // it is simple enough.
+    // TODO: All of these constants should be moved somewhere cleaner when this is all stabilized
+    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+    const IOC_IN: libc::c_ulong = 0x8000_0000;
+    // Adapted from `_IOW` in `<sys/ioccom.h>`
+    const fn iow(g: libc::c_ulong, n: libc::c_ulong, t: libc::c_ulong) -> libc::c_ulong {
+        IOC_IN | (((t) & IOCPARM_MASK) << 16) | ((g) << 8) | n
+    }
+    const IOSSIOSPEED: libc::c_ulong = iow(
+        b'T' as libc::c_ulong,
+        2,
+        std::mem::size_of::<libc::speed_t>() as libc::c_ulong,
+    );
+
+    // Custom baud rates must be applied last because `tcsetattr` writes a standard baud rate
+    if let Some(mut speed) = custom_baud_rate {
+        syscall_result(unsafe { libc::ioctl(raw_fd, IOSSIOSPEED, &mut speed) })?;
+    }
+
+    Ok(())
+}
+
+fn standard_baud_rate(baud_rate: u32) -> Option<libc::speed_t> {
+    Some(match baud_rate {
         50 => libc::B50,
         75 => libc::B75,
         110 => libc::B110,
@@ -270,19 +312,8 @@ fn configure_port(fd: BorrowedFd, settings: &Settings) -> std::io::Result<()> {
         76_800 => libc::B76800,
         115_200 => libc::B115200,
         230_400 => libc::B230400,
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unsupported baud rate: {other}"),
-            ));
-        }
-    };
-    syscall_result(unsafe { libc::cfsetspeed(&mut termios, baud_rate) })?;
-
-    // Set the termios parameters on the fd
-    syscall_result(unsafe { libc::tcsetattr(raw_fd, libc::TCSANOW, &termios) })?;
-
-    Ok(())
+        _ => return None,
+    })
 }
 
 /// Small helper to convert a syscall result into Result<(), std::io::Error>

@@ -11,7 +11,7 @@ impl SerialPort {
     pub async fn open(path: impl AsRef<Path>, baud_rate: u32) -> std::io::Result<Self> {
         let settings = Settings {
             baud_rate,
-            data_bits: DataBits::Five,
+            data_bits: DataBits::Eight,
             parity: Parity::None,
             stop_bits: StopBits::One,
             flow_control: FlowControl::None,

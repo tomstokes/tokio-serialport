@@ -139,11 +139,15 @@ fn open_port(path: &Path, settings: Settings) -> std::io::Result<OwnedFd> {
         .open(path)?;
     let fd = OwnedFd::from(file);
 
-    // TODO: Set exclusivity
+    set_exclusive(fd.as_fd())?;
 
     configure_port(fd.as_fd(), &settings)?;
 
     Ok(fd)
+}
+
+fn set_exclusive(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    syscall_result(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCEXCL as libc::c_ulong) })
 }
 
 fn configure_port(fd: BorrowedFd, settings: &Settings) -> std::io::Result<()> {
@@ -523,7 +527,7 @@ mod tests {
         assert!(
             matches!(
                 error.raw_os_error(),
-                Some(libc::ENODEV) | Some(libc::ENOTTY)
+                Some(libc::ENODEV) | Some(libc::ENOTTY) | Some(libc::EPERM)
             ),
             "unexpected error while opening non-tty path: {error}"
         );

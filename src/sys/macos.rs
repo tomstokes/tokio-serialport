@@ -6,7 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(crate) struct Port {
     fd: AsyncFd<OwnedFd>,
@@ -55,12 +55,58 @@ impl AsyncRead for Port {
     }
 }
 
+impl AsyncWrite for Port {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = self.get_mut();
+        loop {
+            let mut guard = ready!(this.fd.poll_write_ready(cx))?;
+            match guard.try_io(|async_fd| write_fd(async_fd.as_fd(), buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // TODO: Find a way to handle poll_flush without using `tcdrain`, which can block
+        todo!()
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        todo!()
+    }
+}
+
 /// Helper to read from a `BorrowedFd` and retry syscall if interrupted
 fn read_fd(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> std::io::Result<usize> {
     // TODO: Consider cleaning this up with rustix
     loop {
         let result =
             unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            // Retry interrupted syscall immediately
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Helper to write to a `BorrowedFd` and retry syscall if interrupted
+fn write_fd(fd: BorrowedFd<'_>, buffer: &[u8]) -> std::io::Result<usize> {
+    loop {
+        let result = unsafe { libc::write(fd.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
         if result >= 0 {
             return Ok(result as usize);
         }
@@ -244,13 +290,13 @@ mod tests {
     use super::*;
     use std::ffi::{CStr, OsStr};
     use std::future::Future;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::task::Waker;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -328,6 +374,23 @@ mod tests {
             })?
     }
 
+    fn background_read_exact(
+        mut master: std::fs::File,
+        length: usize,
+    ) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>> {
+        tokio::task::spawn_blocking(move || {
+            let mut received = vec![0; length];
+            master.read_exact(&mut received)?;
+            Ok(received)
+        })
+    }
+
+    async fn background_timeout_io<T>(
+        task: tokio::task::JoinHandle<std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        timeout_io(async move { task.await.map_err(std::io::Error::other)? }).await
+    }
+
     async fn complete_after_pending<T>(
         future: impl Future<Output = std::io::Result<T>>,
         on_pending: impl FnOnce() -> std::io::Result<()>,
@@ -403,6 +466,40 @@ mod tests {
             Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
             Err(error) => return Err(error),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_to_master() -> std::io::Result<()> {
+        let (master, mut port) = open_test_port().await?;
+        let expected = b"\x00hello\r\n\x7f\x80\xff";
+        let reader = background_read_exact(master, expected.len());
+
+        timeout_io(port.write_all(expected)).await?;
+        let received = background_timeout_io(reader).await?;
+
+        assert_eq!(&received, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_write_completes_when_master_drains() -> std::io::Result<()> {
+        const PAYLOAD_LENGTH: usize = 256 * 1024;
+
+        let (master, mut port) = open_test_port().await?;
+        let expected: Vec<_> = (0..PAYLOAD_LENGTH).map(|index| index as u8).collect();
+        let mut reader = None;
+
+        complete_after_pending(port.write_all(&expected), || {
+            reader = Some(background_read_exact(master, expected.len()));
+            Ok(())
+        })
+        .await?;
+
+        let reader = reader.expect("write returned Pending without starting the PTY reader");
+        let received = background_timeout_io(reader).await?;
+        assert_eq!(received, expected);
 
         Ok(())
     }

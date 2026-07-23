@@ -75,12 +75,17 @@ impl AsyncWrite for Port {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // TODO: Find a way to handle poll_flush without using `tcdrain`, which can block
-        todo!()
+        // This does not call `tcdrain` because it can block, possibly indefinitely if flow control
+        // is enabled and the other side does not acknowledge.
+        // `TIOCOUTQ` would allow checking the software queue length, but isn't a direct repalcement
+        // For now, `poll_flush` is interpreted as demonstrating that writes have completed, not
+        // that everything has been flushed at the hardware level.
+        // TODO: Document this in the README
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        todo!()
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_flush(cx)
     }
 }
 

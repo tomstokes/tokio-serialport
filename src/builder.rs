@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use crate::{DataBits, FlowControl, Parity, SerialPort, StopBits};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[must_use]
 #[derive(Clone, Debug)]
@@ -10,9 +10,9 @@ pub struct SerialPortBuilder {
 }
 
 impl SerialPortBuilder {
-    pub(crate) fn new(path: impl AsRef<Path>, baud_rate: u32) -> Self {
+    pub(crate) fn new(path: impl Into<PathBuf>, baud_rate: u32) -> Self {
         Self {
-            path: path.as_ref().to_owned(),
+            path: path.into(),
             settings: Settings::new(baud_rate),
         }
     }
@@ -51,6 +51,7 @@ impl SerialPortBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn defaults_to_9600_8_n_1() {

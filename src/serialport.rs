@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use crate::{SerialPortBuilder, sys};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
@@ -11,11 +11,11 @@ pub struct SerialPort {
 
 impl SerialPort {
     // TODO: Support open options like exclusive mode, etc.
-    pub async fn open(path: impl AsRef<Path>, baud_rate: u32) -> std::io::Result<Self> {
+    pub async fn open(path: impl Into<PathBuf>, baud_rate: u32) -> std::io::Result<Self> {
         Self::builder(path, baud_rate).open().await
     }
 
-    pub fn builder(path: impl AsRef<Path>, baud_rate: u32) -> SerialPortBuilder {
+    pub fn builder(path: impl Into<PathBuf>, baud_rate: u32) -> SerialPortBuilder {
         SerialPortBuilder::new(path, baud_rate)
     }
 

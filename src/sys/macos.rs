@@ -3,7 +3,7 @@ use crate::{DataBits, FlowControl, Parity, StopBits};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
@@ -14,8 +14,7 @@ pub(crate) struct Port {
 }
 
 impl Port {
-    pub(crate) async fn open(path: impl AsRef<Path>, settings: Settings) -> std::io::Result<Self> {
-        let path = path.as_ref().to_owned();
+    pub(crate) async fn open(path: PathBuf, settings: Settings) -> std::io::Result<Self> {
         let fd = match tokio::task::spawn_blocking(move || open_port(&path, settings)).await {
             Ok(result) => result?,
             // `tokio::task::spawn_blocking` catches panics. Re-panic if that happens.
@@ -595,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_tty_path() {
         const NON_TTY_PATH: &str = "/dev/null";
-        let error = match Port::open(NON_TTY_PATH, settings()).await {
+        let error = match Port::open(PathBuf::from(NON_TTY_PATH), settings()).await {
             Ok(_) => panic!(
                 "incorrectly able to open non-tty path {} as a serial port",
                 NON_TTY_PATH

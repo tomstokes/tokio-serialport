@@ -1,7 +1,7 @@
 use crate::settings::Settings;
 use crate::{DataBits, FlowControl, Parity, StopBits};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -86,6 +86,18 @@ impl AsyncWrite for Port {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.poll_flush(cx)
+    }
+}
+
+impl AsFd for Port {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for Port {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
@@ -544,8 +556,8 @@ mod tests {
         Ok(())
     }
 
-    fn port_termios(port: &crate::SerialPort) -> std::io::Result<libc::termios> {
-        let raw_fd = port.port().fd.get_ref().as_raw_fd();
+    fn port_termios(port: impl AsFd) -> std::io::Result<libc::termios> {
+        let raw_fd = port.as_fd().as_raw_fd();
         let mut termios = MaybeUninit::<libc::termios>::uninit();
         syscall_result(unsafe { libc::tcgetattr(raw_fd, termios.as_mut_ptr()) })?;
         Ok(unsafe { termios.assume_init() })

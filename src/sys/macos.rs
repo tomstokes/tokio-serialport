@@ -1,4 +1,5 @@
-use crate::{DataBits, FlowControl, Parity, Settings, StopBits};
+use crate::settings::Settings;
+use crate::{DataBits, FlowControl, Parity, StopBits};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -541,6 +542,53 @@ mod tests {
         let received = background_timeout_io(reader).await?;
         assert_eq!(received, expected);
 
+        Ok(())
+    }
+
+    fn port_termios(port: &crate::SerialPort) -> std::io::Result<libc::termios> {
+        let raw_fd = port.port().fd.get_ref().as_raw_fd();
+        let mut termios = MaybeUninit::<libc::termios>::uninit();
+        syscall_result(unsafe { libc::tcgetattr(raw_fd, termios.as_mut_ptr()) })?;
+        Ok(unsafe { termios.assume_init() })
+    }
+
+    #[tokio::test]
+    async fn open_applies_default_settings() -> std::io::Result<()> {
+        let Pty {
+            master: _master,
+            slave_path,
+        } = open_pty()?;
+        let port = crate::SerialPort::open(&slave_path, 9600).await?;
+        let termios = port_termios(&port)?;
+        assert_eq!(termios.c_cflag & libc::CSIZE, libc::CS8);
+        assert_eq!(termios.c_cflag & libc::PARENB, 0);
+        assert_eq!(termios.c_cflag & libc::CSTOPB, 0);
+        assert_eq!(termios.c_cflag & libc::CRTSCTS, 0);
+        assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B9600);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_applies_configured_settings() -> std::io::Result<()> {
+        let Pty {
+            master: _master,
+            slave_path,
+        } = open_pty()?;
+        let port = crate::SerialPort::builder(&slave_path, 9600)
+            .baud_rate(19200)
+            .data_bits(DataBits::Seven)
+            .parity(Parity::Even)
+            .stop_bits(StopBits::Two)
+            .flow_control(FlowControl::Hardware)
+            .open()
+            .await?;
+        let termios = port_termios(&port)?;
+        assert_eq!(termios.c_cflag & libc::CSIZE, libc::CS7);
+        assert_eq!(termios.c_cflag & libc::PARENB, libc::PARENB);
+        assert_eq!(termios.c_cflag & libc::PARODD, 0);
+        assert_eq!(termios.c_cflag & libc::CSTOPB, libc::CSTOPB);
+        assert_eq!(termios.c_cflag & libc::CRTSCTS, libc::CRTSCTS);
+        assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B19200);
         Ok(())
     }
 

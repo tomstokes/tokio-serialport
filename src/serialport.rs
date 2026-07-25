@@ -1,5 +1,6 @@
-use crate::{DataBits, FlowControl, Parity, Settings, StopBits, sys};
-use std::path::Path;
+use crate::settings::Settings;
+use crate::{SerialPortBuilder, sys};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
@@ -9,18 +10,33 @@ pub struct SerialPort {
 }
 
 impl SerialPort {
-    // TODO: Support full user-provided settings
     // TODO: Support open options like exclusive mode, etc.
     pub async fn open(path: impl AsRef<Path>, baud_rate: u32) -> std::io::Result<Self> {
-        let settings = Settings {
-            baud_rate,
-            data_bits: DataBits::Eight,
-            parity: Parity::None,
-            stop_bits: StopBits::One,
-            flow_control: FlowControl::None,
-        };
+        Self::builder(path, baud_rate).open().await
+    }
+
+    pub fn builder(path: impl AsRef<Path>, baud_rate: u32) -> SerialPortBuilder {
+        SerialPortBuilder::new(path, baud_rate)
+    }
+
+    pub(crate) async fn open_with_settings(
+        path: PathBuf,
+        settings: Settings,
+    ) -> std::io::Result<Self> {
         let port = sys::Port::open(path, settings).await?;
         Ok(Self { port })
+    }
+
+    // Test-specific accessor for the underlying `sys::Port`
+    //
+    // TODO: Revisit
+    // I don't especially love having any test-specific code hanging out in our impl, but this
+    // allows accessing the underlying port without having to specify it anywhere. I could make the
+    // `port` field `pub(crate)` or even provide `impl AsFd` long-term, but for now this allows the
+    // test construction to work without changing anything outisde of test mode.
+    #[cfg(test)]
+    pub(crate) fn port(&self) -> &sys::Port {
+        &self.port
     }
 }
 

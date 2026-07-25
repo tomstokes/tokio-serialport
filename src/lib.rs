@@ -2,9 +2,11 @@
 
 extern crate core;
 
-pub mod serialport;
-pub use serialport::SerialPort;
-pub mod settings;
+mod builder;
+mod serialport;
+mod settings;
 mod sys;
 
-pub use settings::{DataBits, FlowControl, Parity, Settings, StopBits};
+pub use builder::SerialPortBuilder;
+pub use serialport::SerialPort;
+pub use settings::{DataBits, FlowControl, Parity, StopBits};

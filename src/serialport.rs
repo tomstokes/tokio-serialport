@@ -29,6 +29,14 @@ impl SerialPort {
         Ok(Self { port })
     }
 
+    pub fn set_dtr(&self, asserted: bool) -> std::io::Result<()> {
+        self.port.set_dtr(asserted)
+    }
+
+    pub fn set_rts(&self, asserted: bool) -> std::io::Result<()> {
+        self.port.set_rts(asserted)
+    }
+
     pub fn cts(&self) -> std::io::Result<bool> {
         self.port.cts()
     }

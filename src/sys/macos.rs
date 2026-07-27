@@ -29,6 +29,14 @@ impl Port {
         Ok(Self { fd: async_fd })
     }
 
+    pub(crate) fn set_dtr(&self, asserted: bool) -> std::io::Result<()> {
+        set_modem_line(self.as_fd(), libc::TIOCM_DTR, asserted)
+    }
+
+    pub(crate) fn set_rts(&self, asserted: bool) -> std::io::Result<()> {
+        set_modem_line(self.as_fd(), libc::TIOCM_RTS, asserted)
+    }
+
     pub(crate) fn cts(&self) -> std::io::Result<bool> {
         read_modem_line(self.as_fd(), libc::TIOCM_CTS)
     }
@@ -115,6 +123,15 @@ impl AsRawFd for Port {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+fn set_modem_line(fd: BorrowedFd<'_>, line: libc::c_int, asserted: bool) -> std::io::Result<()> {
+    let request = if asserted {
+        libc::TIOCMBIS
+    } else {
+        libc::TIOCMBIC
+    };
+    syscall_result(unsafe { libc::ioctl(fd.as_raw_fd(), request, &line) })
 }
 
 fn read_modem_line(fd: BorrowedFd<'_>, line: libc::c_int) -> std::io::Result<bool> {

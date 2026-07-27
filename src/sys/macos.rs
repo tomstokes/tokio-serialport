@@ -28,6 +28,22 @@ impl Port {
         let async_fd = AsyncFd::new(fd)?;
         Ok(Self { fd: async_fd })
     }
+
+    pub(crate) fn cts(&self) -> std::io::Result<bool> {
+        read_modem_line(self.as_fd(), libc::TIOCM_CTS)
+    }
+
+    pub(crate) fn dsr(&self) -> std::io::Result<bool> {
+        read_modem_line(self.as_fd(), libc::TIOCM_DSR)
+    }
+
+    pub(crate) fn ring_indicator(&self) -> std::io::Result<bool> {
+        read_modem_line(self.as_fd(), libc::TIOCM_RI)
+    }
+
+    pub(crate) fn carrier_detect(&self) -> std::io::Result<bool> {
+        read_modem_line(self.as_fd(), libc::TIOCM_CD)
+    }
 }
 
 impl AsyncRead for Port {
@@ -99,6 +115,12 @@ impl AsRawFd for Port {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+fn read_modem_line(fd: BorrowedFd<'_>, line: libc::c_int) -> std::io::Result<bool> {
+    let mut status = 0;
+    syscall_result(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCMGET, &mut status) })?;
+    Ok(status & line != 0)
 }
 
 /// Helper to read from a `BorrowedFd` and retry syscall if interrupted

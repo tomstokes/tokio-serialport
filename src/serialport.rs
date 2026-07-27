@@ -28,6 +28,24 @@ impl SerialPort {
         let port = sys::Port::open(path, settings).await?;
         Ok(Self { port })
     }
+
+    pub fn cts(&self) -> std::io::Result<bool> {
+        self.port.cts()
+    }
+
+    pub fn dsr(&self) -> std::io::Result<bool> {
+        self.port.dsr()
+    }
+
+    pub fn ring_indicator(&self) -> std::io::Result<bool> {
+        self.port.ring_indicator()
+    }
+
+    pub fn carrier_detect(&self) -> std::io::Result<bool> {
+        self.port.carrier_detect()
+    }
+
+    // TODO: Consider adding a "modem status" call for snapshotting all status lines together?
 }
 
 impl tokio::io::AsyncRead for SerialPort {

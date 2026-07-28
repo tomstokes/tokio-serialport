@@ -201,15 +201,9 @@ fn configure_port(fd: BorrowedFd<'_>, settings: &Settings) -> std::io::Result<()
     syscall_result(unsafe { libc::tcgetattr(raw_fd, termios.as_mut_ptr()) })?;
     let mut termios = unsafe { termios.assume_init() };
 
-    apply_settings(&mut termios, settings)?;
-
-    syscall_result(unsafe { libc::tcsetattr(raw_fd, libc::TCSANOW, &termios) })
-}
-
-fn apply_settings(termios: &mut libc::termios, settings: &Settings) -> std::io::Result<()> {
     // Configure the tty to operate in raw mode
     unsafe {
-        libc::cfmakeraw(termios);
+        libc::cfmakeraw(&mut termios);
     }
 
     // Enable receiving
@@ -282,13 +276,54 @@ fn apply_settings(termios: &mut libc::termios, settings: &Settings) -> std::io::
     }
 
     // Configure baud rate
-    // TODO: Support arbitrary baud rates
-    let baud_rate = standard_baud_rate(settings.baud_rate)
-        .ok_or_else(|| {
-            todo!("Custom baud rates not yet implemented");
-        })
-        .unwrap();
-    syscall_result(unsafe { libc::cfsetspeed(termios, baud_rate) })
+    let baud_rate = settings.baud_rate;
+    let custom_baud_rate: Option<u32> = if baud_rate == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "baud rate cannot be zero",
+        ));
+    } else if let Some(standard_speed) = standard_baud_rate(settings.baud_rate) {
+        syscall_result(unsafe { libc::cfsetspeed(&mut termios, standard_speed) })?;
+        None
+    } else {
+        // Set a temporary value in termios
+        syscall_result(unsafe { libc::cfsetspeed(&mut termios, libc::B9600) })?;
+        Some(baud_rate)
+    };
+
+    // Set the termios parameters on the fd
+    syscall_result(unsafe { libc::tcsetattr(raw_fd, libc::TCSANOW, &termios) })?;
+
+    // Custom baud rates must be applied last because `tcsetattr` writes a standard baud rate
+    if let Some(baud_rate) = custom_baud_rate {
+        set_custom_baud_rate(fd, baud_rate)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+fn set_custom_baud_rate(fd: BorrowedFd<'_>, baud_rate: u32) -> std::io::Result<()> {
+    let raw_fd = fd.as_raw_fd();
+    let mut termios2 = MaybeUninit::<libc::termios2>::uninit();
+    syscall_result(unsafe { libc::ioctl(raw_fd, libc::TCGETS2, termios2.as_mut_ptr()) })?;
+    let mut termios2 = unsafe { termios2.assume_init() };
+
+    // Clear input and output baud rate selectors
+    termios2.c_cflag &= !(libc::CBAUD | (libc::CBAUD << libc::IBSHIFT));
+    // Indicate non-standard baud rate
+    termios2.c_cflag |= libc::BOTHER as libc::tcflag_t;
+    // Set both input and output baud rate to the same value
+    termios2.c_ispeed = baud_rate as libc::speed_t;
+    termios2.c_ospeed = baud_rate as libc::speed_t;
+
+    syscall_result(unsafe { libc::ioctl(raw_fd, libc::TCSETS2, &termios2) })
+}
+
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+fn set_custom_baud_rate(_fd: BorrowedFd<'_>, _baud_rate: u32) -> std::io::Result<()> {
+    // TODO: PowerPC doesn't expose termios2, so set baud rate through normal termios
+    todo!("Custom baud rates are not supported on PowerPC")
 }
 
 fn standard_baud_rate(baud_rate: u32) -> Option<libc::speed_t> {
@@ -534,6 +569,14 @@ mod tests {
         Ok(unsafe { termios.assume_init() })
     }
 
+    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+    fn port_termios2(port: impl AsFd) -> std::io::Result<libc::termios2> {
+        let raw_fd = port.as_fd().as_raw_fd();
+        let mut termios = MaybeUninit::<libc::termios2>::uninit();
+        syscall_result(unsafe { libc::ioctl(raw_fd, libc::TCGETS2, termios.as_mut_ptr()) })?;
+        Ok(unsafe { termios.assume_init() })
+    }
+
     #[tokio::test]
     async fn open_applies_default_settings() -> std::io::Result<()> {
         let Pty {
@@ -550,27 +593,57 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn applies_configured_settings() -> std::io::Result<()> {
+    #[tokio::test]
+    async fn builder_applies_configured_settings() -> std::io::Result<()> {
         let Pty {
-            master,
-            slave_path: _slave_path,
+            master: _master,
+            slave_path,
         } = open_pty()?;
-        let mut termios = port_termios(master)?;
-        let settings = Settings {
-            baud_rate: 19_200,
-            data_bits: DataBits::Seven,
-            parity: Parity::Even,
-            stop_bits: StopBits::Two,
-            flow_control: FlowControl::Hardware,
-        };
-        apply_settings(&mut termios, &settings)?;
-        assert_eq!(termios.c_cflag & libc::CSIZE, libc::CS7);
-        assert_eq!(termios.c_cflag & libc::PARENB, libc::PARENB);
-        assert_eq!(termios.c_cflag & libc::PARODD, 0);
+        let port = crate::SerialPort::builder(slave_path, 9_600)
+            .baud_rate(19200)
+            .stop_bits(StopBits::Two)
+            .flow_control(FlowControl::Hardware)
+            .open()
+            .await?;
+        let termios = port_termios(&port)?;
+        assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B19200);
         assert_eq!(termios.c_cflag & libc::CSTOPB, libc::CSTOPB);
         assert_eq!(termios.c_cflag & libc::CRTSCTS, libc::CRTSCTS);
-        assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B19200);
+        // Parity and data bit settings aren't supported on Linux PTY
+        Ok(())
+    }
+
+    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+    #[tokio::test]
+    async fn open_applies_custom_baud_rate() -> std::io::Result<()> {
+        const CUSTOM_BAUD_RATE: u32 = 123456;
+        let Pty {
+            master: _master,
+            slave_path,
+        } = open_pty()?;
+        let port = crate::SerialPort::open(slave_path, CUSTOM_BAUD_RATE).await?;
+        let termios = port_termios2(&port)?;
+        assert_eq!(
+            termios.c_cflag & libc::CBAUD,
+            libc::BOTHER as libc::tcflag_t
+        );
+        assert_eq!(termios.c_cflag & (libc::CBAUD << libc::IBSHIFT), 0);
+        assert_eq!(termios.c_ispeed, CUSTOM_BAUD_RATE as libc::speed_t);
+        assert_eq!(termios.c_ospeed, CUSTOM_BAUD_RATE as libc::speed_t);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_baud_rate() -> std::io::Result<()> {
+        let Pty {
+            master: _master,
+            slave_path,
+        } = open_pty()?;
+        let error = match crate::SerialPort::open(slave_path, 0).await {
+            Ok(_) => panic!("incorrectly opened a serial port with a zero baud rate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         Ok(())
     }
 
